@@ -1,9 +1,10 @@
 import graphene
 from graphene import relay
 from graphene_django.filter import DjangoFilterConnectionField
+from graphql.error import GraphQLError
 
 from ...product import models
-from ...product.templatetags.product_images import product_first_image
+from ...product.templatetags.product_images import get_thumbnail
 from ...product.utils import products_with_details
 from ...product.utils.availability import get_availability
 from ...product.utils.costs import (
@@ -11,7 +12,9 @@ from ...product.utils.costs import (
 from ..core.decorators import permission_required
 from ..core.filters import DistinctFilterSet
 from ..core.types.common import CountableDjangoObjectType
-from ..core.types.money import Money, MoneyRange, TaxedMoney, TaxedMoneyRange
+from ..core.types.money import (
+    Money, MoneyRange, TaxedMoney, TaxedMoneyRange, TaxRateType)
+from ..utils import get_database_id
 from .filters import ProductFilterSet
 
 
@@ -98,6 +101,7 @@ class ProductVariant(CountableDjangoObjectType):
     class Meta:
         description = """Represents a version of a product such as different
         size or color."""
+        exclude_fields = ['variant_images']
         interfaces = [relay.Node]
         model = models.ProductVariant
 
@@ -129,9 +133,7 @@ class Product(CountableDjangoObjectType):
         description='The storefront URL for the product.', required=True)
     thumbnail_url = graphene.String(
         description='The URL of a main thumbnail for a product.',
-        size=graphene.Argument(
-            graphene.String,
-            description='Size of a thumbnail, for example 255x255.'))
+        size=graphene.Argument(graphene.Int, description='Size of thumbnail'))
     availability = graphene.Field(
         ProductAvailability,
         description="""Informs about product's availability in the storefront,
@@ -145,6 +147,11 @@ class Product(CountableDjangoObjectType):
         description='List of product attributes assigned to this product.')
     purchase_cost = graphene.Field(MoneyRange)
     margin = graphene.Field(Margin)
+    image_by_id = graphene.Field(
+        lambda: ProductImage,
+        id=graphene.Argument(
+            graphene.ID, description='ID of a product image.'),
+        description='Get a single product image by ID')
 
     class Meta:
         description = """Represents an individual item for sale in the
@@ -154,8 +161,8 @@ class Product(CountableDjangoObjectType):
 
     def resolve_thumbnail_url(self, info, *, size=None):
         if not size:
-            size = '255x255'
-        return product_first_image(self, size)
+            size = 255
+        return get_thumbnail(self.get_first_image(), size)
 
     def resolve_url(self, info):
         return self.get_absolute_url()
@@ -182,12 +189,20 @@ class Product(CountableDjangoObjectType):
         _, margin = get_product_costs_data(self)
         return Margin(margin[0], margin[1])
 
+    def resolve_image_by_id(self, info, id):
+        pk = get_database_id(info, id, ProductImage)
+        try:
+            return self.images.get(pk=pk)
+        except models.ProductImage.DoesNotExist:
+            raise GraphQLError('Product image not found.')
+
 
 class ProductType(CountableDjangoObjectType):
     products = DjangoFilterConnectionField(
         Product,
         filterset_class=ProductFilterSet,
         description='List of products of this type.')
+    tax_rate = TaxRateType(description='A type of tax rate.')
 
     class Meta:
         description = """Represents a type of product. It defines what
@@ -195,7 +210,7 @@ class ProductType(CountableDjangoObjectType):
         interfaces = [relay.Node]
         model = models.ProductType
 
-    def resolve_products(self, info):
+    def resolve_products(self, info, **kwargs):
         user = info.context.user
         return products_with_details(
             user=user).filter(product_type=self).distinct()
@@ -208,6 +223,7 @@ class Collection(CountableDjangoObjectType):
 
     class Meta:
         description = "Represents a collection of products."
+        exclude_fields = ['voucher_set', 'sale_set', 'menuitem_set']
         filter_fields = {
             'name': ['exact', 'icontains', 'istartswith']}
         interfaces = [relay.Node]
@@ -239,7 +255,9 @@ class Category(CountableDjangoObjectType):
         description = """Represents a single category of products. Categories
         allow to organize products in a tree-hierarchies which can be used for
         navigation in the storefront."""
-        exclude_fields = ['lft', 'rght', 'tree_id']
+        exclude_fields = [
+            'lft', 'rght', 'tree_id', 'voucher_set', 'sale_set',
+            'menuitem_set']
         interfaces = [relay.Node]
         filter_fields = ['id', 'name']
         model = models.Category
@@ -251,8 +269,7 @@ class Category(CountableDjangoObjectType):
         return self.children.distinct()
 
     def resolve_url(self, info):
-        ancestors = self.get_ancestors().distinct()
-        return self.get_absolute_url(ancestors)
+        return self.get_absolute_url()
 
     def resolve_products(self, info, **kwargs):
         qs = models.Product.objects.available_products()
@@ -263,17 +280,18 @@ class Category(CountableDjangoObjectType):
 class ProductImage(CountableDjangoObjectType):
     url = graphene.String(
         required=True,
-        description='',
-        size=graphene.String(
-            description='Size of an image, for example 255x255.'))
+        description='The URL of the image.',
+        size=graphene.Int(description='Size of the image'))
 
     class Meta:
         description = 'Represents a product image.'
-        exclude_fields = ['product', 'productvariant_set', 'variant_images']
+        exclude_fields = [
+            'image', 'product', 'ppoi', 'productvariant_set',
+            'variant_images']
         interfaces = [relay.Node]
         model = models.ProductImage
 
     def resolve_url(self, info, *, size=None):
         if size:
-            return self.image.crop[size].url
+            return get_thumbnail(self.image, size, 'crop')
         return self.image.url

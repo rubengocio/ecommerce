@@ -5,27 +5,36 @@ from graphene.types import Scalar
 from graphene_django import DjangoObjectType
 from graphql.language import ast
 
+from ....core import weight
 from ..connection import CountableConnection
 
 
-# FIXME: not yet merged https://github.com/graphql-python/graphene/pull/726
+# FIXME: Decimal scalar implementation has been taken from Graphene repo.
+# Remove it when a new version including this implementation is released.
 class Decimal(Scalar):
-    """The `Decimal` scalar type represents a python Decimal."""
+    """
+    The `Decimal` scalar type represents a python Decimal.
+    """
 
     @staticmethod
     def serialize(dec):
-        assert isinstance(dec, decimal.Decimal), (
-            'Received not compatible Decimal "{}"'.format(repr(dec)))
+        if isinstance(dec, str):
+            dec = decimal.Decimal(dec)
+        assert isinstance(dec, decimal.Decimal), 'Received not compatible Decimal "{}"'.format(
+            repr(dec))
         return str(dec)
-
-    @staticmethod
-    def parse_value(value):
-        return decimal.Decimal(value)
 
     @classmethod
     def parse_literal(cls, node):
         if isinstance(node, ast.StringValue):
             return cls.parse_value(node.value)
+
+    @staticmethod
+    def parse_value(value):
+        try:
+            return decimal.Decimal(value)
+        except decimal.DecimalException:
+            return None
 
 
 class CountryDisplay(graphene.ObjectType):
@@ -77,3 +86,14 @@ class PermissionDisplay(graphene.ObjectType):
 class SeoInput(graphene.InputObjectType):
     title = graphene.String(description='SEO title.')
     description = graphene.String(description='SEO description.')
+
+
+class Weight(graphene.ObjectType):
+    unit = graphene.String(description='Weight unit', required=True)
+    value = graphene.Float(description='Weight value', required=True)
+
+    class Meta:
+        description = 'Represents weight value in a specific weight unit.'
+
+
+WeightUnitsEnum = graphene.Enum.from_enum(weight.WeightUnitsEnum)

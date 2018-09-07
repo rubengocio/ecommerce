@@ -12,6 +12,7 @@ from django.template.defaultfilters import slugify
 from django_countries.fields import Country
 from faker import Factory
 from faker.providers import BaseProvider
+from measurement.measures import Weight
 from payments import PaymentStatus
 from prices import Money
 
@@ -20,6 +21,7 @@ from ...account.utils import store_user_address
 from ...checkout import AddressType
 from ...core.utils.taxes import get_tax_rate_by_name, get_taxes_for_country
 from ...core.utils.text import strip_html_and_truncate
+from ...dashboard.menu.utils import update_menu
 from ...discount import DiscountValueType, VoucherType
 from ...discount.models import Sale, Voucher
 from ...menu.models import Menu
@@ -31,12 +33,11 @@ from ...product.models import (
     ProductImage, ProductType, ProductVariant)
 from ...product.thumbnails import create_product_thumbnails
 from ...product.utils.attributes import get_name_from_attributes
-from ...shipping.models import ANY_COUNTRY, ShippingMethod
+from ...shipping.models import ShippingMethod, ShippingMethodType, ShippingZone
 from ...shipping.utils import get_taxed_shipping_price
 
 fake = Factory.create()
 
-DELIVERY_REGIONS = [ANY_COUNTRY, 'US', 'PL', 'DE', 'GB']
 PRODUCTS_LIST_DIR = 'products-list/'
 
 GROCERIES_CATEGORY = {'name': 'Groceries', 'image_name': 'groceries.jpg'}
@@ -136,7 +137,8 @@ def create_product_type_with_attributes(name, schema):
     variant_attributes_schema = schema.get('variant_attributes', {})
     is_shipping_required = schema.get('is_shipping_required', True)
     product_type = get_or_create_product_type(
-        name=name, is_shipping_required=is_shipping_required)
+        name=name, is_shipping_required=is_shipping_required,
+        weight=fake.weight())
     product_attributes = create_attributes_and_values(
         product_attributes_schema)
     variant_attributes = create_attributes_and_values(
@@ -241,11 +243,8 @@ class SaleorProvider(BaseProvider):
         return Money(
             fake.pydecimal(2, 2, positive=True), settings.DEFAULT_CURRENCY)
 
-    def delivery_region(self):
-        return random.choice(DELIVERY_REGIONS)
-
-    def shipping_method(self):
-        return random.choice(ShippingMethod.objects.all())
+    def weight(self):
+        return Weight(kg=fake.pydecimal(1, 2, positive=True))
 
 
 fake.add_provider(SaleorProvider)
@@ -293,7 +292,8 @@ def create_product(**kwargs):
         'name': fake.company(),
         'price': fake.money(),
         'description': '\n\n'.join(description),
-        'seo_description': strip_html_and_truncate(description[0], 300)}
+        'seo_description': strip_html_and_truncate(description[0], 300),
+        'weight': fake.weight() if random.randint(0, 1) else None}
     defaults.update(kwargs)
     return Product.objects.create(**defaults)
 
@@ -302,14 +302,16 @@ def create_variant(product, **kwargs):
     defaults = {
         'product': product,
         'quantity': fake.random_int(1, 50),
-        'quantity_allocated': fake.random_int(1, 50)}
+        'quantity_allocated': fake.random_int(1, 50),
+        'weight': fake.weight() if random.randint(0, 1) else None}
     defaults.update(kwargs)
     variant = ProductVariant(**defaults)
     if 'cost_price' not in kwargs:
         variant.cost_price = (variant.base_price * Decimal(
             fake.random_int(10, 99) / 100)).quantize()
     if variant.attributes:
-        variant.name = get_name_from_attributes(variant)
+        attributes = variant.product.product_type.variant_attributes.all()
+        variant.name = get_name_from_attributes(variant, attributes)
     variant.save()
     return variant
 
@@ -454,7 +456,7 @@ def create_fake_order(discounts, taxes):
                 address.first_name, address.last_name)}
 
     shipping_method = ShippingMethod.objects.order_by('?').first()
-    shipping_price = shipping_method.price_per_country.first().price
+    shipping_price = shipping_method.price
     shipping_price = get_taxed_shipping_price(shipping_price, taxes)
     order_data.update({
         'shipping_method_name': shipping_method.name,
@@ -466,6 +468,10 @@ def create_fake_order(discounts, taxes):
 
     order.total = sum(
         [line.get_total() for line in lines], order.shipping_price)
+    weight = Weight(kg=0)
+    for line in order:
+        weight += line.variant.get_weight()
+    order.weight = weight
     order.save()
 
     create_fulfillments(order)
@@ -505,13 +511,68 @@ def create_product_sales(how_many=5):
         yield 'Sale: %s' % (sale,)
 
 
-def create_shipping_methods():
-    shipping_method = ShippingMethod.objects.create(name='UPC')
-    shipping_method.price_per_country.create(price=fake.money())
-    yield 'Shipping method #%d' % shipping_method.id
-    shipping_method = ShippingMethod.objects.create(name='DHL')
-    shipping_method.price_per_country.create(price=fake.money())
-    yield 'Shipping method #%d' % shipping_method.id
+def create_shipping_zone(
+        shipping_methods_names, countries, shipping_zone_name):
+    shipping_zone = ShippingZone.objects.get_or_create(
+        name=shipping_zone_name, defaults={'countries': countries})[0]
+    ShippingMethod.objects.bulk_create([
+        ShippingMethod(
+            name=name, price=fake.money(), shipping_zone=shipping_zone,
+            type=(
+                ShippingMethodType.PRICE_BASED if random.randint(0, 1)
+                else ShippingMethodType.WEIGHT_BASED),
+            minimum_order_price=fake.money(), maximum_order_price=None,
+            minimum_order_weight=fake.weight(), maximum_order_weight=None)
+        for name in shipping_methods_names])
+    return 'Shipping Zone: %s' % shipping_zone
+
+
+def create_shipping_zones():
+    european_countries = [
+        'AX', 'AL', 'AD', 'AT', 'BY', 'BE', 'BA', 'BG', 'HR', 'CZ', 'DK', 'EE',
+        'FO', 'FI', 'FR', 'DE', 'GI', 'GR', 'GG', 'VA', 'HU', 'IS', 'IE', 'IM',
+        'IT', 'JE', 'LV', 'LI', 'LT', 'LU', 'MK', 'MT', 'MD', 'MC', 'ME', 'NL',
+        'NO', 'PL', 'PT', 'RO', 'RU', 'SM', 'RS', 'SK', 'SI', 'ES', 'SJ', 'SE',
+        'CH', 'UA', 'GB']
+    yield create_shipping_zone(
+        shipping_zone_name='Europe', countries=european_countries,
+        shipping_methods_names=[
+            'DHL', 'UPS', 'Registred priority', 'DB Schenker'])
+    oceanian_countries = [
+        'AS', 'AU', 'CX', 'CC', 'CK', 'FJ', 'PF', 'GU', 'HM', 'KI', 'MH', 'FM',
+        'NR', 'NC', 'NZ', 'NU', 'NF', 'MP', 'PW', 'PG', 'PN', 'WS', 'SB', 'TK',
+        'TO', 'TV', 'UM', 'VU', 'WF']
+    yield create_shipping_zone(
+        shipping_zone_name='Oceania', countries=oceanian_countries,
+        shipping_methods_names=['FBA', 'FedEx Express', 'Oceania Air Mail'])
+    asian_countries = [
+        'AF', 'AM', 'AZ', 'BH', 'BD', 'BT', 'BN', 'KH', 'CN', 'CY', 'GE', 'HK',
+        'IN', 'ID', 'IR', 'IQ', 'IL', 'JP', 'JO', 'KZ', 'KP', 'KR', 'KW', 'KG',
+        'LA', 'LB', 'MO', 'MY', 'MV', 'MN', 'MM', 'NP', 'OM', 'PK', 'PS', 'PH',
+        'QA', 'SA', 'SG', 'LK', 'SY', 'TW', 'TJ', 'TH', 'TL', 'TR', 'TM', 'AE',
+        'UZ', 'VN', 'YE']
+    yield create_shipping_zone(
+        shipping_zone_name='Asia', countries=asian_countries,
+        shipping_methods_names=['China Post', 'TNT', 'Aramex', 'EMS'])
+    american_countries = [
+        'AI', 'AG', 'AR', 'AW', 'BS', 'BB', 'BZ', 'BM', 'BO', 'BQ', 'BV', 'BR',
+        'CA', 'KY', 'CL', 'CO', 'CR', 'CU', 'CW', 'DM', 'DO', 'EC', 'SV', 'FK',
+        'GF', 'GL', 'GD', 'GP', 'GT', 'GY', 'HT', 'HN', 'JM', 'MQ', 'MX', 'MS',
+        'NI', 'PA', 'PY', 'PE', 'PR', 'BL', 'KN', 'LC', 'MF', 'PM', 'VC', 'SX',
+        'GS', 'SR', 'TT', 'TC', 'US', 'UY', 'VE', 'VG', 'VI']
+    yield create_shipping_zone(
+        shipping_zone_name='Americas', countries=american_countries,
+        shipping_methods_names=['DHL', 'UPS', 'FedEx', 'EMS'])
+    african_countries = [
+        'DZ', 'AO', 'BJ', 'BW', 'IO', 'BF', 'BI', 'CV', 'CM', 'CF', 'TD', 'KM',
+        'CG', 'CD', 'CI', 'DJ', 'EG', 'GQ', 'ER', 'SZ', 'ET', 'TF', 'GA', 'GM',
+        'GH', 'GN', 'GW', 'KE', 'LS', 'LR', 'LY', 'MG', 'MW', 'ML', 'MR', 'MU',
+        'YT', 'MA', 'MZ', 'NA', 'NE', 'NG', 'RE', 'RW', 'SH', 'ST', 'SN', 'SC',
+        'SL', 'SO', 'ZA', 'SS', 'SD', 'TZ', 'TG', 'TN', 'UG', 'EH', 'ZM', 'ZW']
+    yield create_shipping_zone(
+        shipping_zone_name='Africa', countries=african_countries,
+        shipping_methods_names=[
+            'Royale International', 'ACE', 'fastway couriers', 'Post Office'])
 
 
 def create_vouchers():
@@ -539,10 +600,13 @@ def create_vouchers():
         yield 'Value voucher already exists'
 
 
-def set_featured_products(how_many=8):
-    pks = Product.objects.order_by('?')[:how_many].values_list('pk', flat=True)
-    Product.objects.filter(pk__in=pks).update(is_featured=True)
-    yield 'Featured products created'
+def set_homepage_collection():
+    homepage_collection = Collection.objects.order_by('?').first()
+    site = Site.objects.get_current()
+    site_settings = site.settings
+    site_settings.homepage_collection = homepage_collection
+    site_settings.save()
+    yield 'Homepage collection assigned'
 
 
 def add_address_to_admin(email):
@@ -633,6 +697,8 @@ def create_menus():
             name=page.title,
             page=page)
         yield 'Created footer menu'
+    update_menu(top_menu)
+    update_menu(bottom_menu)
     site = Site.objects.get_current()
     site_settings = site.settings
     site_settings.top_menu = top_menu
